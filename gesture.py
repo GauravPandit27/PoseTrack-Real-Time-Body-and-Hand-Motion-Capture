@@ -1,10 +1,9 @@
 import cv2
 import mediapipe as mp
-import matplotlib.pyplot as plt
 import numpy as np
-import time
 import json
 from datetime import datetime
+import atexit
 
 # Initialize MediaPipe Pose and Hands
 mp_pose = mp.solutions.pose
@@ -15,175 +14,185 @@ hands = mp_hands.Hands(min_detection_confidence=0.7, min_tracking_confidence=0.7
 
 mp_drawing = mp.solutions.drawing_utils
 
-# Create a 2D Plot for stickman animation
-fig, ax = plt.subplots(figsize=(6, 6))
-ax.set_xlim(0, 1)
-ax.set_ylim(0, 1)
-ax.set_xlabel('X')
-ax.set_ylabel('Y')
-
-# Initialize webcam feed
+# Initialize webcam
 cap = cv2.VideoCapture(0)
-
-# Set the window to fullscreen
-cv2.namedWindow("Body and Hand Landmarks", cv2.WINDOW_NORMAL)
-cv2.setWindowProperty("Body and Hand Landmarks", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-
-print("Starting webcam... Displaying body and hand landmarks.")
+if not cap.isOpened():
+    raise RuntimeError("Error: Webcam not detected.")
 
 # Flags and data for recording and replaying
 recording = False
 replaying = False
-recorded_data = []  # Store recorded frames with landmarks
-replay_index = 0    # Track the replay frame index
+recorded_data = []
+replay_index = 0
 
-# Helper function to save recorded data
 def save_recording(data):
+    """Save recorded data to a JSON file."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"recording_{timestamp}.json"
     with open(filename, "w") as f:
         json.dump(data, f)
     print(f"Recording saved as {filename}")
 
-while cap.isOpened():
-    try:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        
-        # Flip the frame for a mirror effect
-        frame = cv2.flip(frame, 1)
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # Handle replay mode
-        if replaying:
-            if replay_index < len(recorded_data):
-                # Retrieve landmarks from the recorded data
-                body_landmarks_2d = recorded_data[replay_index].get("body", [])
-                hand_landmarks_2d = recorded_data[replay_index].get("hands", [])
-                replay_index += 1
-            else:
-                # End replay mode and reset
-                replaying = False
-                replay_index = 0
-                print("Replay finished. Resuming normal detection.")
-                continue
-        else:
-            # Process the frame for body and hand landmarks
-            pose_results = pose.process(rgb_frame)
-            hand_results = hands.process(rgb_frame)
+def draw_landmarks_on_blank(image, body_landmarks, hand_landmarks):
+    """Draw landmarks on a blank image."""
+    height, width, _ = image.shape
 
-            # Extract 2D body landmarks
-            body_landmarks_2d = []
-            if pose_results.pose_landmarks:
-                for lm in pose_results.pose_landmarks.landmark:
-                    body_landmarks_2d.append((lm.x, 1 - lm.y))  # Invert Y for correct orientation
-            
-            # Extract 2D hand landmarks
-            hand_landmarks_2d = []
-            if hand_results.multi_hand_landmarks:
-                for hand_landmarks in hand_results.multi_hand_landmarks:
-                    hand_landmarks_2d.append([(lm.x, 1 - lm.y) for lm in hand_landmarks.landmark])
+    # Draw body landmarks
+    if body_landmarks:
+        for lm in body_landmarks:
+            x, y = int(lm[0] * width), int(lm[1] * height)
+            cv2.circle(image, (x, y), 5, (0, 255, 0), -1)
 
-            # Record data if in recording mode
-            if recording:
-                recorded_data.append({"body": body_landmarks_2d, "hands": hand_landmarks_2d})
-        
-        # Clear previous 2D plot
-        ax.cla()
+        # Define body connections
+        body_connections = [
+            (11, 13), (13, 15), (15, 17), (17, 19), (19, 21),  # Right arm
+            (12, 14), (14, 16), (16, 18), (18, 20), (20, 22),  # Left arm
+            (23, 25), (25, 27), (27, 29), (29, 31),  # Right leg
+            (24, 26), (26, 28), (28, 30), (30, 32),  # Left leg
+            (11, 23), (12, 24), (23, 24)  # Shoulders to hips
+        ]
+        for start, end in body_connections:
+            if start < len(body_landmarks) and end < len(body_landmarks):
+                x1, y1 = int(body_landmarks[start][0] * width), int(body_landmarks[start][1] * height)
+                x2, y2 = int(body_landmarks[end][0] * width), int(body_landmarks[end][1] * height)
+                cv2.line(image, (x1, y1), (x2, y2), (0, 255, 255), 2)
 
-        # Plot body landmarks
-        if body_landmarks_2d:
-            body_x = [lm[0] for lm in body_landmarks_2d]
-            body_y = [lm[1] for lm in body_landmarks_2d]
-            ax.scatter(body_x, body_y, color='r', marker='o', label='Body Landmarks')
+    # Draw hand landmarks
+    if hand_landmarks:
+        for hand in hand_landmarks:
+            for lm in hand:
+                x, y = int(lm[0] * width), int(lm[1] * height)
+                cv2.circle(image, (x, y), 5, (255, 0, 0), -1)
 
-            # Define and draw connections
-            body_connections = [
-                # Face connections
-                (8, 6), (6, 5), (5, 4), (4, 8),  # Left Eye
-                (1, 2), (2, 3), (3, 7), (7, 1),  # Right Eye
-                (0, 1), (0, 2), (0, 3), (0, 7), (0, 6), (0, 5), (0, 4),  # Nose to eyes
-                (9, 10),  # Mouth
-
-                # Shoulders and arms
-                (12, 11),  # Shoulders
-                (12, 14),  # Left shoulder to left elbow
-                (14, 18), (18, 20), (20, 22),  # Left arm
-                (11, 13),  # Right shoulder to right elbow
-                (13, 15), (15, 19), (19, 17),  # Right arm
-
-                # Waist and torso
-                (24, 23),  # Waist
-                (11, 23), (12, 24),  # Shoulders to waist
-
-                # Legs
-                (24, 26), (26, 28), (28, 30),  # Left leg
-                (23, 25), (25, 27), (27, 29),  # Right leg
-                (29, 31), (31, 33),  # Right foot additional connections
-                (30, 32), (32, 34),  # Left foot additional connections
+            # Define hand connections
+            hand_connections = [
+                (0, 1), (1, 2), (2, 3), (3, 4),  # Thumb
+                (5, 6), (6, 7), (7, 8),  # Index
+                (9, 10), (10, 11), (11, 12),  # Middle
+                (13, 14), (14, 15), (15, 16),  # Ring
+                (17, 18), (18, 19), (19, 20)  # Pinky
             ]
-            for start, end in body_connections:
-                if start < len(body_landmarks_2d) and end < len(body_landmarks_2d):
-                    ax.plot([body_landmarks_2d[start][0], body_landmarks_2d[end][0]],
-                            [body_landmarks_2d[start][1], body_landmarks_2d[end][1]], 'k-', lw=2)
+            for start, end in hand_connections:
+                if start < len(hand) and end < len(hand):
+                    x1, y1 = int(hand[start][0] * width), int(hand[start][1] * height)
+                    x2, y2 = int(hand[end][0] * width), int(hand[end][1] * height)
+                    cv2.line(image, (x1, y1), (x2, y2), (255, 0, 255), 2)
 
-        # Plot hand landmarks
-        if hand_landmarks_2d:
-            for hand in hand_landmarks_2d:
-                hand_x = [lm[0] for lm in hand]
-                hand_y = [lm[1] for lm in hand]
-                ax.scatter(hand_x, hand_y, color='b', marker='o', label='Hand Landmarks')
-                
-                hand_connections = [
-                    (0, 1), (1, 2), (2, 3), (3, 4),  # Thumb
-                    (5, 6), (6, 7), (7, 8),  # Index
-                    (9, 10), (10, 11), (11, 12),  # Middle
-                    (13, 14), (14, 15), (15, 16),  # Ring
-                    (17, 18), (18, 19), (19, 20)  # Pinky
-                ]
-                for start, end in hand_connections:
-                    if start < len(hand) and end < len(hand):
-                        ax.plot([hand[start][0], hand[end][0]], [hand[start][1], hand[end][1]], 'b-', lw=2)
+    return image
 
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1)
-        plt.draw()
-        plt.pause(0.01)
-        
-        # Display landmarks on frame
-        if not replaying and pose_results.pose_landmarks:
-            mp_drawing.draw_landmarks(frame, pose_results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
-        if not replaying and hand_results.multi_hand_landmarks:
-            for hand_landmarks in hand_results.multi_hand_landmarks:
-                mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-        
-        # Display webcam feed
-        cv2.imshow("Body and Hand Landmarks", frame)
+def mirror_landmarks(landmarks, flip_x_only=True):
+    """Mirror the landmarks along the X-axis (horizontally)."""
+    mirrored_landmarks = []
+    for lm in landmarks:
+        if flip_x_only:
+            mirrored_x = 1 - lm[0]  # Flip the x-coordinate
+            mirrored_landmarks.append((mirrored_x, lm[1]))  # Keep the y-coordinate the same
+        else:
+            mirrored_x = 1 - lm[0]  # Flip the x-coordinate
+            mirrored_y = lm[1]  # Flip the y-coordinate too, if needed
+            mirrored_landmarks.append((mirrored_x, mirrored_y))
+    return mirrored_landmarks
 
-        # Key controls
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):  # Quit
-            break
-        elif key == ord('w'):  # Start recording
-            recording = True
-            recorded_data = []  # Reset recorded data
-            print("Recording started.")
-        elif key == ord('e'):  # Stop recording
-            recording = False
-            save_recording(recorded_data)
-            print("Recording stopped.")
-        elif key == ord('a'):  # Replay recording
-            if recorded_data:
-                replaying = True
-                replay_index = 0
-                print("Replaying recording.")
+def cleanup():
+    """Ensure resources are cleaned up on exit."""
+    cap.release()
+    cv2.destroyAllWindows()
+    print("Resources released.")
+
+atexit.register(cleanup)
+
+def main():
+    global recording, replaying, replay_index
+
+    print("Starting webcam... Press 'q' to quit, 'w' to record, 'e' to stop recording, 'a' to replay.")
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Error: Frame capture failed.")
+                break
+
+            # Flip the frame by 1 (horizontal flip) for the webcam
+            frame = cv2.flip(frame, 1)
+            frame_height, frame_width, _ = frame.shape
+
+            # Create a blank image for visualization
+            blank_image = np.zeros_like(frame)
+
+            if replaying:
+                if replay_index < len(recorded_data):
+                    body_landmarks = recorded_data[replay_index].get("body", [])
+                    hand_landmarks = recorded_data[replay_index].get("hands", [])
+                    replay_index += 1
+                else:
+                    replaying = False
+                    replay_index = 0
+                    print("Replay finished.")
+                    continue
             else:
-                print("No recording to replay.")
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pose_results = pose.process(rgb_frame)
+                hand_results = hands.process(rgb_frame)
+
+                # Extract body and hand landmarks
+                body_landmarks = []
+                if pose_results.pose_landmarks:
+                    body_landmarks = [(lm.x, 1 - lm.y) for lm in pose_results.pose_landmarks.landmark]
+
+                hand_landmarks = []
+                if hand_results.multi_hand_landmarks:
+                    for hand_landmarks_data in hand_results.multi_hand_landmarks:
+                        hand_landmarks.append([(lm.x, 1 - lm.y) for lm in hand_landmarks_data.landmark])
+
+                # Mirror the hand and body landmarks
+                hand_landmarks = [mirror_landmarks(hand) for hand in hand_landmarks]
+                body_landmarks = mirror_landmarks(body_landmarks, flip_x_only=True)
+
+                if recording:
+                    recorded_data.append({"body": body_landmarks, "hands": hand_landmarks})
+
+            # Draw landmarks on blank image
+            blank_image = draw_landmarks_on_blank(blank_image, body_landmarks, hand_landmarks)
+
+            # Rotate the blank image by 180 degrees (this rotates the visualization, not the webcam feed)
+            blank_image = cv2.rotate(blank_image, cv2.ROTATE_180)
+
+            # Combine both images for side-by-side display
+            combined_image = np.hstack((frame, blank_image))
+
+            # Display instructions and combined image
+            cv2.putText(frame, "Press 'w' to Record, 'e' to Stop, 'a' to Replay, 'q' to Quit",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            if recording:
+                cv2.putText(frame, "Recording...", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            elif replaying:
+                cv2.putText(frame, "Replaying...", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
+            cv2.imshow("Body and Hand Landmarks", combined_image)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):  # Quit
+                break
+            elif key == ord("w"):  # Start recording
+                recording = True
+                recorded_data = []
+                print("Recording started.")
+            elif key == ord("e"):  # Stop recording
+                recording = False
+                save_recording(recorded_data)
+                print("Recording stopped.")
+            elif key == ord("a"):  # Replay recording
+                if recorded_data:
+                    replaying = True
+                    replay_index = 0
+                    print("Replaying recording.")
+                else:
+                    print("No recording to replay.")
+
     except KeyboardInterrupt:
-        print("Program interrupted. Exiting...")
-        break
+        print("Program interrupted.")
+    finally:
+        cleanup()
 
-cap.release()
-cv2.destroyAllWindows()
-
+if __name__ == "__main__":
+    main()
